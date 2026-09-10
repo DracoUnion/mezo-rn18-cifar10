@@ -9,15 +9,16 @@ import ssl
 ssl._create_default_https_context = ssl._create_unverified_context
 
 # 超参数
-lr = 1e-6
-epsilon = 1e-9
-grad_clip_norm = 1.0  # 裁剪阈值
-batch_size = 2
-num_epochs = 5
-print_step = 10
-n_queries = 2
+lr = 1e-2
+epsilon = 1e-3
+grad_clip_norm = 10.0
+batch_size = 128
+num_epochs = 10
+print_step = 20
+n_queries = 32
 weight_decay = 0.1
-sparsity_ratio = 0.2
+sparsity_ratio = 0.0
+bn_update_freq = 50  # 每 50 个 batch 更新一次 BN running stats
 
 # -------------------- MeZO 优化器实现 --------------------
 class MeZO:
@@ -120,7 +121,7 @@ class MeZO:
                 grad_est.norm().item() ** 2
                 for grad_est in grad_ests.values()
             ]) ** 0.5
-            scale = min(1.0, grad_clip_norm / (total_norm + 1e-6))
+            scale = min(1.0, self.grad_clip_norm / (total_norm + 1e-6))
             
             for n, p in param_dict.items():
                 p.data.sub_(self.lr * grad_ests[n] * scale)   # ZO-SGD 更新
@@ -146,13 +147,23 @@ def main():
     ])
 
     trainset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transform_train)
-    trainloader = DataLoader(trainset, batch_size=batch_size, shuffle=True, num_workers=2)
+    trainloader = DataLoader(trainset, batch_size=batch_size, shuffle=True, num_workers=0)
 
     testset = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=transform_test)
-    testloader = DataLoader(testset, batch_size=batch_size, shuffle=False, num_workers=2)
+    testloader = DataLoader(testset, batch_size=batch_size, shuffle=False, num_workers=0)
 
     # 2. 模型定义（ResNet18，输出为10类）
     model = resnet18(pretrained=False, num_classes=10).to(device)
+
+    # 冻结 backbone，只训练最后 fc 层（MeZO 适用场景：低维参数微调）
+    for name, param in model.named_parameters():
+        if 'fc' not in name:
+            param.requires_grad = False
+
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Trainable params: {trainable_params:,} / {total_params:,} ({100*trainable_params/total_params:.2f}%)")
+
     criterion = nn.CrossEntropyLoss()
 
     # 3. 初始化 MeZO 优化器（超参数可根据需要调整）
@@ -172,16 +183,31 @@ def main():
         for batch_idx, (inputs, labels) in enumerate(trainloader):
             inputs, labels = inputs.to(device), labels.to(device)
 
+            # 定期用 train 模式跑几个 batch 更新 BN running stats
+            if batch_idx % bn_update_freq == 0 and batch_idx > 0:
+                model.train()
+                with torch.no_grad():
+                    for bn_inputs, bn_labels in trainloader:
+                        bn_inputs = bn_inputs.to(device)
+                        _ = model(bn_inputs)
+                        break  # 只跑 1 个 batch 更新 stats
+                model.eval()
+
             # 定义损失函数（闭包，捕获当前 batch 的数据）
+            # 关键：ZO 扰动估计必须冻结 BN running stats，否则
+            # loss_pos/loss_neg 的差会混入 BN 漂移，污染梯度估计。
+            model.eval()
+
             def loss_fn():
-                outputs = model(inputs)
+                with torch.no_grad():
+                    outputs = model(inputs)
                 return criterion(outputs, labels)
 
             # 执行一步 MeZO 更新（两次前向，无反向传播）
             loss_pos, loss_neg = optimizer.step(loss_fn)
             total_loss += (loss_pos + loss_neg) / 2
 
-            # 每 100 个 batch 打印一次进度
+            # 每 print_step 个 batch 打印一次进度
             if batch_idx % print_step == 0:
                 print(f"Epoch {epoch+1}/{num_epochs} | Batch {batch_idx} | Loss_pos: {loss_pos:.4f} | Loss_neg: {loss_neg:.4f}")
 
